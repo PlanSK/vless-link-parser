@@ -112,13 +112,13 @@ class XraySubscriptionParser:
 
         # Add tag if present
         if data["tag"]:
+            outbound["tag"] = data["tag"]
             if "#" in data["tag"]:
                 tag_parts_list = data["tag"].split("#")
                 print(
                     "WARNING: too many '#' characters in 'tag' parameter. Taking last part."
                 )
                 outbound["tag"] = tag_parts_list[-1]
-            outbound["tag"] = data["tag"]
 
         # WebSocket handling
         if outbound["streamSettings"]["network"] == "ws":
