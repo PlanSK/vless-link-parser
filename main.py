@@ -1,12 +1,28 @@
 import base64
 import json
+import re
 import sys
 import urllib.parse
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import requests
 from loguru import logger
+
+_STUB_TAG_MARKERS = (
+    "app not supported",
+    "not supported",
+    "limit of devices",
+    "device limit",
+    "devices reached",
+    "subscription expired",
+    "expired",
+    "no access",
+    "access denied",
+    "blocked",
+)
+_TAG_SANITIZE_RE = re.compile(r"[^\x20-\x7E]+")
+_TAG_SPACES_RE = re.compile(r"\s+")
 
 
 class XraySubscriptionParser:
@@ -17,6 +33,13 @@ class XraySubscriptionParser:
         self.parsed = None
         self.config = None
 
+    def _sanitize_tag(self, tag: str) -> str:
+        """Keeps printable ASCII, replaces whitespace runs with '_'."""
+        if not tag:
+            return ""
+        cleaned = _TAG_SANITIZE_RE.sub("", tag).strip()
+        return re.sub(r"\s+", "_", cleaned).strip("_")
+
     def parse(self) -> Dict[str, Any]:
         """Parses URI and returns outbound configuration"""
 
@@ -26,38 +49,34 @@ class XraySubscriptionParser:
         # Remove protocol prefix
         source_uri = self.uri[8:]
 
-        # Extract tag (fragment after #)
+        # Extract fragment (tag) — everything after the first '#'
         tag = None
         if "#" in source_uri:
             uri_without_protocol, tag = source_uri.split("#", 1)
+        else:
+            uri_without_protocol = source_uri
 
-        # Split into parts before and after @
         if "@" not in uri_without_protocol:
             raise ValueError("Invalid URI format: missing @")
 
         before_at, after_at = uri_without_protocol.split("@", 1)
-
-        # UUID is everything before @
         uuid = before_at
 
         # Split address:port and parameters
         if "?" in after_at:
             address_port, query_string = after_at.split("?", 1)
             query_params = urllib.parse.parse_qs(query_string)
-            # Convert values to strings (parse_qs returns lists)
             params = {k: v[0] if v else "" for k, v in query_params.items()}
         else:
             address_port = after_at
             params = {}
 
-        # Split address and port
+        # Split address and port (with IPv6 in brackets support)
         if ":" in address_port:
-            # May be IPv6 in brackets
             if address_port.startswith("["):
-                # IPv6 address in brackets: [::1]:443
                 end_bracket = address_port.index("]")
                 address = address_port[1:end_bracket]
-                port_str = address_port[end_bracket + 2 :]  # Skip ]:
+                port_str = address_port[end_bracket + 2 :]  # skip ']:'
                 if not port_str:
                     raise ValueError("Port not specified")
                 port = int(port_str)
@@ -70,7 +89,6 @@ class XraySubscriptionParser:
         else:
             raise ValueError("Port not specified")
 
-        # Build configuration
         self.parsed = {
             "uuid": uuid,
             "address": address,
@@ -83,21 +101,17 @@ class XraySubscriptionParser:
         return self.config
 
     def _build_outbound(self) -> Dict[str, Any]:
-        """Builds outbound object from parsed data"""
-
         if not self.parsed:
             raise ValueError("Call parse() first")
 
         data = self.parsed
         params = data["params"]
 
-        # Main outbound structure
-
         transport_type = params.get("type", "raw")
-        if params.get("type", "raw") == "tcp":
+        if transport_type == "tcp":
             transport_type = "raw"
 
-        outbound = {
+        outbound: Dict[str, Any] = {
             "protocol": "vless",
             "settings": {
                 "address": data["address"],
@@ -112,28 +126,31 @@ class XraySubscriptionParser:
             },
         }
 
-        # Add tag if present
+        # Tag handling (supports URIs with two '#')
         if data["tag"]:
-            outbound["tag"] = data["tag"]
-            if "#" in data["tag"]:
-                tag_parts_list = data["tag"].split("#")
+            raw_tag = data["tag"]
+            if "#" in raw_tag:
                 logger.warning(
-                    "Too many '#' characters in 'tag' parameter. Taking last part."
+                    "Multiple '#' characters in tag '{}'. Taking last part.",
+                    raw_tag,
                 )
-                outbound["tag"] = tag_parts_list[-1]
+                raw_tag = raw_tag.split("#")[-1]
+            cleaned = self._sanitize_tag(urllib.parse.unquote(raw_tag))
+            if cleaned:
+                outbound["tag"] = cleaned
 
-        # WebSocket handling
-        if outbound["streamSettings"]["network"] == "ws":
+        network = outbound["streamSettings"]["network"]
+
+        if network == "ws":
             ws_settings = {}
             if "path" in params:
-                # Decode path (e.g., %2F -> /)
                 ws_settings["path"] = urllib.parse.unquote(params["path"])
             if "host" in params:
                 ws_settings["headers"] = {"Host": params["host"]}
             if ws_settings:
                 outbound["streamSettings"]["wsSettings"] = ws_settings
 
-        if outbound["streamSettings"]["network"] == "xhttp":
+        elif network == "xhttp":
             xhttp_settings = {}
             if "path" in params:
                 xhttp_settings["path"] = urllib.parse.unquote(params["path"])
@@ -142,12 +159,18 @@ class XraySubscriptionParser:
             if "mode" in params:
                 xhttp_settings["mode"] = params["mode"]
             if "extra" in params:
-                xhttp_settings["extra"] = json.loads(params["extra"])
+                try:
+                    xhttp_settings["extra"] = json.loads(params["extra"])
+                except json.JSONDecodeError as e:
+                    logger.warning(
+                        "Cannot parse 'extra' JSON for '{}': {}",
+                        data["address"],
+                        e,
+                    )
             if xhttp_settings:
                 outbound["streamSettings"]["xhttpSettings"] = xhttp_settings
 
-        # gRPC handling
-        elif outbound["streamSettings"]["network"] == "grpc":
+        elif network == "grpc":
             grpc_settings = {}
             if "path" in params:
                 grpc_settings["serviceName"] = urllib.parse.unquote(
@@ -158,8 +181,7 @@ class XraySubscriptionParser:
             if grpc_settings:
                 outbound["streamSettings"]["grpcSettings"] = grpc_settings
 
-        # QUIC handling
-        elif outbound["streamSettings"]["network"] == "quic":
+        elif network == "quic":
             quic_settings = {}
             if "headerType" in params:
                 quic_settings["header"] = {"type": params["headerType"]}
@@ -175,7 +197,6 @@ class XraySubscriptionParser:
 
         if security == "reality":
             reality_settings = {}
-
             if "sni" in params:
                 reality_settings["serverName"] = params["sni"]
             elif "serverName" in params:
@@ -203,7 +224,6 @@ class XraySubscriptionParser:
 
         elif security == "tls":
             tls_settings = {}
-
             if "sni" in params:
                 tls_settings["serverName"] = params["sni"]
             elif "serverName" in params:
@@ -215,8 +235,7 @@ class XraySubscriptionParser:
                 tls_settings["fingerprint"] = params["fingerprint"]
 
             if "alpn" in params:
-                alpn_values = params["alpn"].split(",")
-                tls_settings["alpn"] = alpn_values
+                tls_settings["alpn"] = params["alpn"].split(",")
 
             if "allowInsecure" in params:
                 tls_settings["allowInsecure"] = (
@@ -241,51 +260,50 @@ class XraySubscriptionParser:
         return outbound
 
     def to_json(self, indent: int = 2, compact: bool = False) -> str:
-        """Returns configuration in JSON format"""
-        if not self.config:
-            self.parse()
-
+        if self.config is None:
+            raise RuntimeError("Call parse() first")
         if compact:
             return json.dumps(self.config, separators=(",", ":"))
         return json.dumps(self.config, indent=indent, ensure_ascii=False)
 
 
-def get_outbounds_section(subscription_urls_list: list) -> list:
-    """
-    Parses subscription (list of URIs separated by newlines)
-    Returns list of outbound configurations
-    """
-    outbounds = [{"tag": "DIRECT", "protocol": "freedom", "settings": {}}]
-    unique_tags = set()
+def is_stub_outbound(outbound: Dict[str, Any]) -> bool:
+    """Detects placeholder outbounds returned by misbehaving subscriptions."""
+    settings = outbound.get("settings", {})
+    address = settings.get("address", "")
+    port = settings.get("port")
+    uuid = settings.get("id", "")
 
-    for uri in subscription_urls_list:
-        try:
-            parser = XraySubscriptionParser(uri)
-            outbound = parser.parse()
-            tag = outbound.get("tag") or "VLESS_TAG"
+    if address in ("0.0.0.0", "127.0.0.1", "::") and port == 1:
+        return True
+    if uuid == "00000000-0000-0000-0000-000000000000":
+        return True
 
-            if tag in unique_tags:
-                base = tag
-                counter = 1
-                while f"{base}_{counter}" in unique_tags:
-                    counter += 1
-                tag = f"{base}_{counter}"
-                logger.debug("Duplicated tag '{}' renamed to '{}'.", base, tag)
-            outbound["tag"] = tag
-            unique_tags.add(tag)
+    tag = (outbound.get("tag") or "").lower()
+    if any(marker in tag for marker in _STUB_TAG_MARKERS):
+        return True
 
-            outbounds.append(outbound)
-        except Exception as e:
-            logger.error("Error parsing URI: {}... - {}", uri[:50], e)
-            continue
-
-    return outbounds
+    return False
 
 
-def get_vless_url(sub_url: str) -> str:
+def get_vless_urls(sub_url: str) -> List[str]:
+    """Returns a list of VLESS URIs from a subscription URL or a raw URI."""
     if sub_url.startswith("vless://"):
-        return sub_url
-    resp = requests.get(sub_url)
+        return [sub_url]
+
+    resp = requests.get(
+        sub_url,
+        timeout=15,
+        headers={
+            "User-Agent": "Happ/3.13.0",
+            "X-Device-Os": "Android",
+            "X-Device-Locale": "ru",
+            "X-Device-Model": "ELP-NX1",
+            "X-Ver-Os": "15",
+            "Accept-Encoding": "gzip",
+            "X-Hwid": "74jf74nf8f4jr5je",
+        },
+    )
     resp.raise_for_status()
     raw = resp.text.strip()
 
@@ -295,20 +313,58 @@ def get_vless_url(sub_url: str) -> str:
     except Exception:
         decoded = raw
 
-    # Parse every vless:// link to decoded one string by string
-    vless_links = [
+    return [
         line.strip()
         for line in decoded.splitlines()
         if line.startswith("vless://")
     ]
-    if not vless_links:
-        raise ValueError("No vless links in subscription")
-
-    # Take first link for example (logic can be changed)
-    return vless_links[0]
 
 
-if __name__ == "__main__":
+def get_outbounds_section(vless_uris: List[str]) -> List[Dict[str, Any]]:
+    """
+    Parses a flat list of VLESS URIs into outbound configurations.
+    """
+    outbounds: List[Dict[str, Any]] = [
+        {"tag": "DIRECT", "protocol": "freedom", "settings": {}}
+    ]
+    unique_tags = set()
+
+    for uri in vless_uris:
+        try:
+            parser = XraySubscriptionParser(uri)
+            outbound = parser.parse()
+        except Exception as e:
+            logger.error("Error parsing URI '{}...': {}", uri[:50], e)
+            continue
+
+        if is_stub_outbound(outbound):
+            logger.warning(
+                "Skipping stub outbound (address={}, port={}, tag='{}'). "
+                "The subscription may require a specific User-Agent.",
+                outbound["settings"].get("address"),
+                outbound["settings"].get("port"),
+                outbound.get("tag"),
+            )
+            continue
+
+        tag = outbound.get("tag") or outbound["settings"]["address"]
+
+        if tag in unique_tags:
+            base = tag
+            counter = 1
+            while f"{base}_{counter}" in unique_tags:
+                counter += 1
+            tag = f"{base}_{counter}"
+            logger.debug("Duplicated tag '{}' renamed to '{}'.", base, tag)
+
+        outbound["tag"] = tag
+        unique_tags.add(tag)
+        outbounds.append(outbound)
+
+    return outbounds
+
+
+def main() -> int:
     input_file = Path("subscriptions.txt")
     output_file = Path("xray_config.json")
 
@@ -318,23 +374,31 @@ if __name__ == "__main__":
         ).splitlines()
     except FileNotFoundError:
         logger.error("File '{}' does not exist.", input_file)
-        sys.exit(1)
+        return 1
     except OSError as e:
         logger.error("Cannot read '{}': {}", input_file, e)
-        sys.exit(1)
+        return 1
 
     subscriptions_list = [s.strip() for s in subscriptions_list if s.strip()]
 
     if not subscriptions_list:
         logger.warning("File '{}' is empty. Nothing to do.", input_file)
-        sys.exit(0)
+        return 0
 
-    try:
-        vless_subs_list = [get_vless_url(line) for line in subscriptions_list]
-        outbounds = get_outbounds_section(vless_subs_list)
-    except Exception as e:
-        logger.exception("Failed to build outbounds: {}", e)
-        sys.exit(2)
+    vless_uris: List[str] = []
+    for line in subscriptions_list:
+        try:
+            vless_uris.extend(get_vless_urls(line))
+        except requests.RequestException as e:
+            logger.error("Network error for '{}...': {}", line[:50], e)
+        except Exception as e:
+            logger.error("Failed to fetch '{}...': {}", line[:50], e)
+
+    if not vless_uris:
+        logger.error("No VLESS URIs collected from subscriptions.")
+        return 2
+
+    outbounds = get_outbounds_section(vless_uris)
 
     tmp_file = output_file.with_suffix(output_file.suffix + ".tmp")
     try:
@@ -344,10 +408,15 @@ if __name__ == "__main__":
     except (OSError, TypeError, ValueError) as e:
         logger.exception("Failed to write '{}': {}", output_file, e)
         tmp_file.unlink(missing_ok=True)
-        sys.exit(3)
+        return 3
 
     logger.info(
         "File '{}' has been written ({} outbounds).",
         output_file,
         len(outbounds),
     )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
