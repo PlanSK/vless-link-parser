@@ -141,6 +141,8 @@ class XraySubscriptionParser:
                 xhttp_settings["host"] = params["host"]
             if "mode" in params:
                 xhttp_settings["mode"] = params["mode"]
+            if "extra" in params:
+                xhttp_settings["extra"] = json.loads(params["extra"])
             if xhttp_settings:
                 outbound["streamSettings"]["xhttpSettings"] = xhttp_settings
 
