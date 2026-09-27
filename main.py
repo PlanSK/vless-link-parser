@@ -1,10 +1,10 @@
 import base64
 import json
-import re
+import sys
 import urllib.parse
+from pathlib import Path
 from typing import Any, Dict
 
-import loguru
 import requests
 from loguru import logger
 
@@ -248,7 +248,6 @@ class XraySubscriptionParser:
         return json.dumps(self.config, indent=indent, ensure_ascii=False)
 
 
-# Usage example
 def get_outbounds_section(subscription_urls_list: list) -> list:
     """
     Parses subscription (list of URIs separated by newlines)
@@ -308,24 +307,45 @@ def get_vless_url(sub_url: str) -> str:
 
 
 if __name__ == "__main__":
-    input_file = "subscriptions.txt"
-    output_file = "xray_config.json"
-    subscriptions_list = []
+    input_file = Path("subscriptions.txt")
+    output_file = Path("xray_config.json")
+
     try:
-        with open(input_file, "r") as input_data:
-            subscriptions_list = input_data.read().splitlines()
+        subscriptions_list = input_file.read_text(
+            encoding="utf-8"
+        ).splitlines()
     except FileNotFoundError:
-        logger.error("File {} does not exist.", input_file)
+        logger.error("File '{}' does not exist.", input_file)
+        sys.exit(1)
+    except OSError as e:
+        logger.error("Cannot read '{}': {}", input_file, e)
+        sys.exit(1)
 
-    if len(subscriptions_list):
-        vless_subs_list = [
-            get_vless_url(vless_list) for vless_list in subscriptions_list
-        ]
+    subscriptions_list = [s.strip() for s in subscriptions_list if s.strip()]
 
+    if not subscriptions_list:
+        logger.warning("File '{}' is empty. Nothing to do.", input_file)
+        sys.exit(0)
+
+    try:
+        vless_subs_list = [get_vless_url(line) for line in subscriptions_list]
         outbounds = get_outbounds_section(vless_subs_list)
+    except Exception as e:
+        logger.exception("Failed to build outbounds: {}", e)
+        sys.exit(2)
 
-        with open(output_file, "w") as file:
-            file.write(json.dumps(outbounds, indent=2, ensure_ascii=False))
-        logger.debug("File {} has been written.", output_file)
-    else:
-        logger.debug("Nothing to do.")
+    tmp_file = output_file.with_suffix(output_file.suffix + ".tmp")
+    try:
+        with tmp_file.open("w", encoding="utf-8") as f:
+            json.dump(outbounds, f, indent=2, ensure_ascii=False)
+        tmp_file.replace(output_file)
+    except (OSError, TypeError, ValueError) as e:
+        logger.exception("Failed to write '{}': {}", output_file, e)
+        tmp_file.unlink(missing_ok=True)
+        sys.exit(3)
+
+    logger.info(
+        "File '{}' has been written ({} outbounds).",
+        output_file,
+        len(outbounds),
+    )
