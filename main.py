@@ -4,6 +4,7 @@ import re
 import urllib.parse
 from typing import Any, Dict
 
+import loguru
 import requests
 from loguru import logger
 
@@ -254,14 +255,27 @@ def get_outbounds_section(subscription_urls_list: list) -> list:
     Returns list of outbound configurations
     """
     outbounds = [{"tag": "DIRECT", "protocol": "freedom", "settings": {}}]
+    unique_tags = set()
 
     for uri in subscription_urls_list:
         try:
             parser = XraySubscriptionParser(uri)
             outbound = parser.parse()
+            tag = outbound.get("tag") or "VLESS_TAG"
+
+            if tag in unique_tags:
+                base = tag
+                counter = 1
+                while f"{base}_{counter}" in unique_tags:
+                    counter += 1
+                tag = f"{base}_{counter}"
+                logger.debug("Duplicated tag '{}' renamed to '{}'.", base, tag)
+            outbound["tag"] = tag
+            unique_tags.add(tag)
+
             outbounds.append(outbound)
         except Exception as e:
-            logger.error(f"Error parsing URI: {uri[:50]}... - {e}")
+            logger.error("Error parsing URI: {}... - {}", uri[:50], e)
             continue
 
     return outbounds
@@ -301,8 +315,8 @@ if __name__ == "__main__":
         with open(input_file, "r") as input_data:
             subscriptions_list = input_data.read().splitlines()
     except FileNotFoundError:
-        logger.error(f"File '{input_file}' does not exist.")
-        
+        logger.error("File {} does not exist.", input_file)
+
     if len(subscriptions_list):
         vless_subs_list = [
             get_vless_url(vless_list) for vless_list in subscriptions_list
@@ -312,6 +326,6 @@ if __name__ == "__main__":
 
         with open(output_file, "w") as file:
             file.write(json.dumps(outbounds, indent=2, ensure_ascii=False))
-        logger.debug(f'File "{output_file}" has been written.')
+        logger.debug("File {} has been written.", output_file)
     else:
         logger.debug("Nothing to do.")
