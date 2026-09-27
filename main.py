@@ -5,6 +5,7 @@ import urllib.parse
 from typing import Any, Dict
 
 import requests
+from loguru import logger
 
 
 class XraySubscriptionParser:
@@ -115,8 +116,8 @@ class XraySubscriptionParser:
             outbound["tag"] = data["tag"]
             if "#" in data["tag"]:
                 tag_parts_list = data["tag"].split("#")
-                print(
-                    "WARNING: too many '#' characters in 'tag' parameter. Taking last part."
+                logger.warning(
+                    "Too many '#' characters in 'tag' parameter. Taking last part."
                 )
                 outbound["tag"] = tag_parts_list[-1]
 
@@ -256,12 +257,11 @@ def get_outbounds_section(subscription_urls_list: list) -> list:
 
     for uri in subscription_urls_list:
         try:
-            print(uri)
             parser = XraySubscriptionParser(uri)
             outbound = parser.parse()
             outbounds.append(outbound)
         except Exception as e:
-            print(f"Error parsing URI: {uri[:50]}... - {e}")
+            logger.error(f"Error parsing URI: {uri[:50]}... - {e}")
             continue
 
     return outbounds
@@ -294,17 +294,24 @@ def get_vless_url(sub_url: str) -> str:
 
 
 if __name__ == "__main__":
-    input_file = "subscription.txt"
+    input_file = "subscriptions.txt"
     output_file = "xray_config.json"
-    with open(input_file, "r") as input_data:
-        subscriptions_list = input_data.read().splitlines()
+    subscriptions_list = []
+    try:
+        with open(input_file, "r") as input_data:
+            subscriptions_list = input_data.read().splitlines()
+    except FileNotFoundError:
+        logger.error(f"File '{input_file}' does not exist.")
+        
+    if len(subscriptions_list):
+        vless_subs_list = [
+            get_vless_url(vless_list) for vless_list in subscriptions_list
+        ]
 
-    vless_subs_list = [
-        get_vless_url(vless_list) for vless_list in subscriptions_list
-    ]
+        outbounds = get_outbounds_section(vless_subs_list)
 
-    outbounds = get_outbounds_section(vless_subs_list)
-
-    with open(output_file, "w") as file:
-        file.write(json.dumps(outbounds, indent=2, ensure_ascii=False))
-    print(f'File "{output_file}" has been written.')
+        with open(output_file, "w") as file:
+            file.write(json.dumps(outbounds, indent=2, ensure_ascii=False))
+        logger.debug(f'File "{output_file}" has been written.')
+    else:
+        logger.debug("Nothing to do.")
